@@ -1,13 +1,8 @@
 import os
 import math
 import datetime
-import urllib.request
-import gzip
-import shutil
-import ssl
 import json
 import threading
-import subprocess
 from flask import Flask, request, send_file, Response
 import tempfile
 
@@ -74,12 +69,6 @@ def gps_time_to_tow(year, month, day, hour, minute, second):
     sec_int, sec_frac = int(second), second - int(second)
     total = (datetime.datetime(year, month, day, hour, minute, sec_int) - datetime.datetime(1980, 1, 6)).total_seconds() + sec_frac
     return total - (int(total // 604800) * 604800)
-
-def get_gps_week_dow(year, month, day):
-    dt = datetime.datetime(year, month, day)
-    gps_epoch = datetime.datetime(1980, 1, 6)
-    delta = dt - gps_epoch
-    return delta.days // 7, delta.days % 7
 
 # =====================================================================
 # ALGEBRA LINEAL (PYTHON PURO ESTRICTO - CERO NUMPY)
@@ -157,9 +146,7 @@ def parse_rinex_obs_completo(path):
                     for sc, t in sys_tokens.items():
                         sys_idx[sc] = {
                             'C1': next((i for i, x in enumerate(t) if x.startswith('C1')), -1),
-                            'L1': next((i for i, x in enumerate(t) if x.startswith('L1')), -1),
                             'C5': next((i for i, x in enumerate(t) if x.startswith('C5')), -1),
-                            'L5': next((i for i, x in enumerate(t) if x.startswith('L5')), -1),
                             'S1': next((i for i, x in enumerate(t) if x.startswith('S1')), -1),
                             'S5': next((i for i, x in enumerate(t) if x.startswith('S5')), -1)
                         }
@@ -237,97 +224,9 @@ def generar_rinex_sincronizado(raw_path, out_path, obs_dict):
                 c5_s = f"{c5:14.3f}" if c5 > 0 else "              "
                 f_out.write(f"{sat}{c1_s}                  {c5_s}                  \n")
 
-def obtener_fecha_obs(filepath):
-    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-        for line in f:
-            if line.startswith('>'):
-                partes = line[1:].strip().split()
-                if len(partes) >= 6: 
-                    try:
-                        y = int(partes[0])
-                        return (y if y>100 else y+2000), int(partes[1]), int(partes[2]), int(partes[3]), int(partes[4]), float(partes[5])
-                    except: pass
-    return None
-
 # =====================================================================
-# PRODUCTOS IGS (SISTEMA DE REDUNDANCIA DUAL)
+# PRODUCTOS IGS (PARSEADORES DE ARCHIVOS MANUALES)
 # =====================================================================
-def descargar_productos_igs_stream(year, month, day, hour):
-    dt = datetime.datetime(year, month, day)
-    doy = dt.timetuple().tm_yday
-    week, dow = get_gps_week_dow(year, month, day)
-    
-    nav_descargado = os.path.join(UPLOAD_FOLDER, f"auto_nav_{year}_{doy:03d}.nav")
-    sp3_descargado = os.path.join(UPLOAD_FOLDER, f"igu{week}{dow}_00.sp3")
-    
-    # Evasión de certificados SSL para evitar bloqueos en la nube
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    
-    # 1. Descarga NAV (Respaldo absoluto)
-    if not os.path.exists(nav_descargado):
-        urls_nav = [f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00IGS_R_{year}{doy:03d}0000_01D_MN.rnx.gz"]
-        for url in urls_nav:
-            try:
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, context=ctx, timeout=8) as res:
-                    yield ("INFO", f"> Descargando Efemérides Broadcast (Respaldo NAV)...\n")
-                    with open(nav_descargado + '.gz', 'wb') as f: f.write(res.read())
-                    with gzip.open(nav_descargado + '.gz', 'rb') as f_in, open(nav_descargado, 'wb') as f_out: shutil.copyfileobj(f_in, f_out)
-                    yield ("SUCCESS_NAV", nav_descargado)
-                    break
-            except Exception: pass
-
-    # 2. REDUNDANCIA DUAL: Descarga SP3 Ultra-Rápido
-    if not os.path.exists(sp3_descargado):
-        hrs = ['00', '06', '12', '18']
-        exito_sp3 = False
-        
-        for hr in hrs:
-            if exito_sp3: break
-            
-            # ESTRATEGIA A: Buscar formato moderno .gz en servidores múltiples (Nativo de Python)
-            urls_gz = [
-                f"https://igs.bkg.bund.de/root_ftp/IGS/products/{week}/igu{week}{dow}_{hr}.sp3.gz",
-                f"ftp://igs.ign.fr/pub/igs/products/{week}/igu{week}{dow}_{hr}.sp3.gz"
-            ]
-            
-            for url_gz in urls_gz:
-                try:
-                    req = urllib.request.Request(url_gz, headers={'User-Agent': 'Mozilla/5.0'})
-                    with urllib.request.urlopen(req, context=ctx, timeout=5) as res:
-                        yield ("INFO", f"> Extrayendo SP3 Precisos en formato moderno (.gz)...\n")
-                        with open(sp3_descargado + '.gz', 'wb') as f: f.write(res.read())
-                        with gzip.open(sp3_descargado + '.gz', 'rb') as f_in, open(sp3_descargado, 'wb') as f_out: shutil.copyfileobj(f_in, f_out)
-                        yield ("SUCCESS_SP3", sp3_descargado)
-                        exito_sp3 = True
-                        break
-                except Exception: pass
-            
-            if exito_sp3: break
-            
-            # ESTRATEGIA B: Fallback a legado .Z forzando descompresor Unix interno
-            url_z = f"https://igs.bkg.bund.de/root_ftp/IGS/products/{week}/igu{week}{dow}_{hr}.sp3.Z"
-            sp3_descargado_z = sp3_descargado + '.Z'
-            try:
-                req = urllib.request.Request(url_z, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, context=ctx, timeout=5) as res:
-                    yield ("INFO", f"> Fallback SP3: Descargando formato legado (.Z)...\n")
-                    with open(sp3_descargado_z, 'wb') as f: f.write(res.read())
-                    yield ("INFO", "> Activando motor Gunzip de Amazon Linux (Vercel)...\n")
-                    
-                    # Llamada estricta validada para Vercel
-                    subprocess.run(["gunzip", "-f", sp3_descargado_z], check=False, capture_output=True)
-                    
-                    if os.path.exists(sp3_descargado):
-                        yield ("SUCCESS_SP3", sp3_descargado)
-                        exito_sp3 = True
-                        break
-            except Exception: pass
-            
-    yield ("END", "Proceso de captura IGS finalizado.\n")
-
 def parse_sp3_preciso(path):
     sp3_data = {}
     if not path or not os.path.exists(path): return sp3_data
@@ -582,7 +481,7 @@ def calcular_dd_ppk_lambda_epoca(sd_epoca, nav, sp3, X_b, Y_b, Z_b, tr, mask_ang
             
             sp_r, sp_b = None, None
             
-            # --- Inyección SP3: Híbrido de Seguridad ---
+            # --- Inyección SP3: Operación Estricta ---
             if sp3 and s in sp3:
                 sp3_res_r = interpolate_sp3(sp3, s, t_emision_r)
                 sp3_res_b = interpolate_sp3(sp3, s, t_emision_b)
@@ -810,10 +709,12 @@ def generar_informe_homogeneizacion_detallado(base_name, rover_name, base_raw, r
     return informe
 
 def generar_informe_ascii(tipo, p_dict):
-    estado_sol = 'FLOAT (DGPS + SP3)'
+    estado_sol = 'FLOAT (DGPS + SP3)' if p_dict.get('sp3_file') else 'FLOAT (DGPS)'
     
     err_h_str = f"± {f_14(p_dict['err_h'])} m (Vinculante)" if p_dict['err_h'] > 0 else 'Inactiva'
     err_v_str = f"± {f_14(p_dict['err_v'])} m (Vinculante)" if p_dict['err_v'] > 0 else 'Inactiva'
+    
+    sp3_str = p_dict['sp3_file'] if p_dict.get('sp3_file') else "No provisto (Fallback a Broadcast NAV)"
     
     informe = f"""
 ========================================================================
@@ -836,13 +737,14 @@ def generar_informe_ascii(tipo, p_dict):
 ------------------------------------------------------------------------
   [-] Archivo Control (Base) : {p_dict['base_file']}
   [-] Archivo Móvil (Rover)  : {p_dict['rover_file']}
-  [-] Archivo Efemérides     : {p_dict['nav_file']}
+  [-] Archivo Efemérides NAV : {p_dict['nav_file']}
+  [-] Archivo Preciso SP3    : {sp3_str}
 
 [2] ESTRATEGIA MATEMÁTICA Y ESTADÍSTICA
 ------------------------------------------------------------------------
   [-] Motor Algorítmico      : Diferencias Dobles Pseudodistancia C1/C5
   [-] Órbitas Satelitales    : SP3 Interpolación Lagrange (Si aplica)
-  [-] Resolución Matriz      : Ajuste IRLS Mínimos Cuadrados
+  [-] Resolución Matriz      : Ajuste IRLS Mínimos Cuadrados (Python Puro)
   [-] Sincronización Épocas  : Emparejamiento Dinámico Estricto
 
 [3] CALIDAD GEOMÉTRICA (QA / QC)
@@ -926,31 +828,37 @@ def tab1_homogenizar():
 
 @app.route('/API/tab2_efemerides', methods=['POST'])
 def tab2_efemerides():
+    f_nav = request.files.get('file_nav')
+    f_sp3 = request.files.get('file_sp3')
+    
+    if not f_nav or f_nav.filename == '':
+        return Response("> [ERROR] El archivo de respaldo .nav es obligatorio.\n", mimetype='text/plain')
+
+    nav_path = os.path.join(UPLOAD_FOLDER, 'manual_nav.nav')
+    f_nav.save(nav_path)
+    guardar_estado('nav_path', nav_path)
+    guardar_estado('name_nav_file', f_nav.filename)
+    
+    sp3_path = None
+    if f_sp3 and f_sp3.filename != '':
+        sp3_path = os.path.join(UPLOAD_FOLDER, 'manual_sp3.sp3')
+        f_sp3.save(sp3_path)
+        guardar_estado('sp3_path', sp3_path)
+        guardar_estado('name_sp3_file', f_sp3.filename)
+    else:
+        guardar_estado('sp3_path', None)
+        guardar_estado('name_sp3_file', None)
+
     def procesar():
-        try:
-            yield "> [SISTEMA] Iniciando Para-Metrización Orbital de Precisión...\n"
-            bp = leer_estado('base_raw')
-            if not bp or not os.path.exists(bp): yield "> [ERROR FATAL] Falta RINEX Base en memoria.\n"; return
-            ft = obtener_fecha_obs(bp)
-            if not ft: yield "> [ERROR FATAL] Imposible extraer la fecha.\n"; return
-            
-            nav_p, sp3_p = None, None
-            descarga_exitosa = False
-            
-            for tipo, log in descargar_productos_igs_stream(ft[0], ft[1], ft[2], ft[3]):
-                if tipo == "INFO": yield f"  {log}"
-                elif tipo == "SUCCESS_NAV": nav_p = log; descarga_exitosa = True
-                elif tipo == "SUCCESS_SP3": sp3_p = log
-                elif tipo == "ERROR": yield f"> [ERROR CRÍTICO RED] {log}\n"; return 
-            
-            if descarga_exitosa and nav_p:
-                guardar_estado('nav_path', nav_p); guardar_estado('name_nav_file', os.path.basename(nav_p))
-                if sp3_p: guardar_estado('sp3_path', sp3_p)
-                yield f"> [ÉXITO] Archivo de efemérides NAV almacenado en: {nav_p}\n"
-                if sp3_p: yield f"> [ÉXITO] Órbitas SP3 almacenadas en: {sp3_p}\n"
-                yield "\n[SUCCESS]"
-            else: yield "> [ERROR] No se logró descargar ni construir el archivo local.\n"
-        except Exception as e: yield f"\n> [ERROR GENERAL] Excepción capturada: {str(e)}"
+        yield "> [SISTEMA] Inyectando Efemérides Manuales en Memoria RAM...\n"
+        yield f"  [-] Archivo NAV Transmitido cargado: {f_nav.filename}\n"
+        if sp3_path:
+            yield f"  [-] Archivo SP3 Preciso cargado: {f_sp3.filename}\n"
+            yield "  [*] Motor Híbrido SP3 Activado.\n"
+        else:
+            yield "  [!] No se detectó archivo SP3. El motor DGPS operará estrictamente con Efemérides Transmitidas (NAV).\n"
+        yield "\n[SUCCESS]"
+
     return Response(procesar(), mimetype='text/plain')
 
 @app.route('/API/tab3_calibrar', methods=['POST'])
@@ -985,7 +893,7 @@ def tab3_calibrar():
             p_r_h = leer_estado('rover_calib_homo')
 
             if not nav_path or not p_b_h or not p_r_h: 
-                yield "> [ERROR FATAL] Faltan archivos RINEX o Efemérides.\n"; return
+                yield "> [ERROR FATAL] Faltan archivos RINEX o Efemérides en memoria. Ve a la Pestaña 2.\n"; return
 
             obs_b_raw = parse_rinex_obs_completo(p_b_h)
             obs_r_raw = parse_rinex_obs_completo(p_r_h)
@@ -1017,7 +925,7 @@ def tab3_calibrar():
                     coords_raw.append((nt, et, al - h_r, status))
             
             if not coords_raw:
-                yield "> [ERROR] Nube de puntos bruta colapsada.\n"; return
+                yield "> [ERROR] Nube de puntos bruta colapsada. Verifique la calidad del RINEX.\n"; return
                 
             deltas_h = [math.hypot(c[0] - utm_n_r, c[1] - utm_e_r) for c in coords_raw]
             deltas_v = [abs(c[2] - utm_c_r) for c in coords_raw]
@@ -1261,6 +1169,7 @@ def tab4_procesar():
                 'base_file': leer_estado('name_base_raw') or "base.obs",
                 'rover_file': rf_nuevo_filename,
                 'nav_file': leer_estado('name_nav_file') or "auto_nav.nav",
+                'sp3_file': leer_estado('name_sp3_file'),
                 'b_n': utm_n, 'b_e': utm_e, 'b_z': utm_c,
                 'r_n_calc': nf, 'r_e_calc': ef, 'r_z_calc': zf - h_r
             }
@@ -1274,4 +1183,3 @@ def tab4_procesar():
 if __name__ == '__main__':
     # PUERTO 6000 A SOLICITUD DEL OPERADOR PARA AISLAR ENTORNO LOCAL
     app.run(host='0.0.0.0', port=6000, debug=True)
-
