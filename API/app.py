@@ -1,6 +1,10 @@
 import os
 import math
 import datetime
+import urllib.request
+import gzip
+import shutil
+import ssl
 import json
 import threading
 from flask import Flask, request, send_file, Response
@@ -223,6 +227,18 @@ def generar_rinex_sincronizado(raw_path, out_path, obs_dict):
                 c1_s = f"{c1:14.3f}" if c1 > 0 else "              "
                 c5_s = f"{c5:14.3f}" if c5 > 0 else "              "
                 f_out.write(f"{sat}{c1_s}                  {c5_s}                  \n")
+
+def obtener_fecha_obs(filepath):
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            if line.startswith('>'):
+                partes = line[1:].strip().split()
+                if len(partes) >= 6: 
+                    try:
+                        y = int(partes[0])
+                        return (y if y>100 else y+2000), int(partes[1]), int(partes[2]), int(partes[3]), int(partes[4]), float(partes[5])
+                    except: pass
+    return None
 
 # =====================================================================
 # PRODUCTOS IGS (PARSEADORES DE ARCHIVOS MANUALES)
@@ -715,6 +731,7 @@ def generar_informe_ascii(tipo, p_dict):
     err_v_str = f"± {f_14(p_dict['err_v'])} m (Vinculante)" if p_dict['err_v'] > 0 else 'Inactiva'
     
     sp3_str = p_dict['sp3_file'] if p_dict.get('sp3_file') else "No provisto (Fallback a Broadcast NAV)"
+    nav_str = p_dict.get('nav_file', "auto_nav.nav")
     
     informe = f"""
 ========================================================================
@@ -737,7 +754,7 @@ def generar_informe_ascii(tipo, p_dict):
 ------------------------------------------------------------------------
   [-] Archivo Control (Base) : {p_dict['base_file']}
   [-] Archivo Móvil (Rover)  : {p_dict['rover_file']}
-  [-] Archivo Efemérides NAV : {p_dict['nav_file']}
+  [-] Archivo Efemérides NAV : {nav_str}
   [-] Archivo Preciso SP3    : {sp3_str}
 
 [2] ESTRATEGIA MATEMÁTICA Y ESTADÍSTICA
@@ -828,16 +845,7 @@ def tab1_homogenizar():
 
 @app.route('/API/tab2_efemerides', methods=['POST'])
 def tab2_efemerides():
-    f_nav = request.files.get('file_nav')
     f_sp3 = request.files.get('file_sp3')
-    
-    if not f_nav or f_nav.filename == '':
-        return Response("> [ERROR] El archivo de respaldo .nav es obligatorio.\n", mimetype='text/plain')
-
-    nav_path = os.path.join(UPLOAD_FOLDER, 'manual_nav.nav')
-    f_nav.save(nav_path)
-    guardar_estado('nav_path', nav_path)
-    guardar_estado('name_nav_file', f_nav.filename)
     
     sp3_path = None
     if f_sp3 and f_sp3.filename != '':
@@ -850,14 +858,50 @@ def tab2_efemerides():
         guardar_estado('name_sp3_file', None)
 
     def procesar():
-        yield "> [SISTEMA] Inyectando Efemérides Manuales en Memoria RAM...\n"
-        yield f"  [-] Archivo NAV Transmitido cargado: {f_nav.filename}\n"
-        if sp3_path:
-            yield f"  [-] Archivo SP3 Preciso cargado: {f_sp3.filename}\n"
-            yield "  [*] Motor Híbrido SP3 Activado.\n"
-        else:
-            yield "  [!] No se detectó archivo SP3. El motor DGPS operará estrictamente con Efemérides Transmitidas (NAV).\n"
-        yield "\n[SUCCESS]"
+        try:
+            yield "> [SISTEMA] Iniciando Inyección Híbrida de Efemérides...\n"
+            if sp3_path:
+                yield f"  [-] Archivo SP3 Preciso cargado manualmente: {f_sp3.filename}\n"
+            else:
+                yield "  [!] No se detectó archivo SP3 manual. Se usará solo Broadcast NAV.\n"
+
+            yield "\n> [RED] Conectando con IGS BKG para descargar Respaldo NAV (11+ MB)...\n"
+            
+            bp = leer_estado('base_raw')
+            if not bp or not os.path.exists(bp): 
+                yield "> [ERROR FATAL] Falta RINEX Base en memoria para extraer fecha. Ve a la Pestaña 1 primero.\n"; return
+            
+            ft = obtener_fecha_obs(bp)
+            if not ft: 
+                yield "> [ERROR FATAL] Imposible extraer la fecha del RINEX Base.\n"; return
+            
+            year, month, day = ft[0], ft[1], ft[2]
+            dt = datetime.datetime(year, month, day)
+            doy = dt.timetuple().tm_yday
+            
+            nav_gz = os.path.join(UPLOAD_FOLDER, f"auto_nav_{year}_{doy:03d}.nav.gz")
+            nav_path = os.path.join(UPLOAD_FOLDER, f"auto_nav_{year}_{doy:03d}.nav")
+            
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            
+            if not os.path.exists(nav_path):
+                url_nav = f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00IGS_R_{year}{doy:03d}0000_01D_MN.rnx.gz"
+                req = urllib.request.Request(url_nav, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, context=ctx, timeout=15) as res:
+                    yield f"  [-] Descargando {url_nav.split('/')[-1]} en segundo plano (Bypass de Payload)...\n"
+                    with open(nav_gz, 'wb') as f: f.write(res.read())
+                    yield "  [-] Descomprimiendo archivo NAV de alta densidad...\n"
+                    with gzip.open(nav_gz, 'rb') as f_in, open(nav_path, 'wb') as f_out: shutil.copyfileobj(f_in, f_out)
+            
+            guardar_estado('nav_path', nav_path)
+            guardar_estado('name_nav_file', os.path.basename(nav_path))
+            yield f"  [-] Archivo NAV listo y ensamblado en memoria.\n"
+            
+            yield "\n[SUCCESS]"
+        except Exception as e:
+            yield f"\n> [ERROR FATAL] Fallo en descarga automática NAV: {str(e)}\n"
 
     return Response(procesar(), mimetype='text/plain')
 
@@ -1183,3 +1227,4 @@ def tab4_procesar():
 if __name__ == '__main__':
     # PUERTO 6000 A SOLICITUD DEL OPERADOR PARA AISLAR ENTORNO LOCAL
     app.run(host='0.0.0.0', port=6000, debug=True)
+
