@@ -7,10 +7,9 @@ import shutil
 import ssl
 import json
 import threading
-from flask import Flask, request, send_file, Response, jsonify
+import subprocess
+from flask import Flask, request, send_file, Response
 import tempfile
-import numpy as np
-import scipy.linalg as la
 
 app = Flask(__name__)
 
@@ -82,6 +81,60 @@ def get_gps_week_dow(year, month, day):
     delta = dt - gps_epoch
     return delta.days // 7, delta.days % 7
 
+# =====================================================================
+# ALGEBRA LINEAL (PYTHON PURO ESTRICTO - CERO NUMPY)
+# =====================================================================
+def transpose_matrix(M):
+    if not M or not M[0]: return []
+    try: return [[M[j][i] for j in range(len(M))] for i in range(len(M[0]))]
+    except IndexError: return []
+
+def matmul(A, B):
+    if not A or not B or not A[0] or not B[0]: return []
+    try:
+        result = [[0.0 for _ in range(len(B[0]))] for _ in range(len(A))]
+        for i in range(len(A)):
+            for j in range(len(B[0])):
+                for k in range(len(B)):
+                    result[i][j] += A[i][k] * B[k][j]
+        return result
+    except IndexError: return []
+
+def invert_matrix_nxn(M):
+    if not M or not M[0]: return None
+    try:
+        n = len(M)
+        A = [[float(M[i][j]) for j in range(n)] for i in range(n)]
+        I = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+        
+        for i in range(n):
+            max_k = i
+            for k in range(i + 1, n):
+                if abs(A[k][i]) > abs(A[max_k][i]): max_k = k
+            if max_k != i:
+                A[i], A[max_k] = A[max_k], A[i]
+                I[i], I[max_k] = I[max_k], I[i]
+            
+            pivot = A[i][i]
+            if abs(pivot) < 1e-15: return None 
+            
+            for j in range(n):
+                A[i][j] /= pivot
+                I[i][j] /= pivot
+                
+            for k in range(n):
+                if k == i: continue
+                factor = A[k][i]
+                for j in range(n):
+                    A[k][j] -= factor * A[i][j]
+                    I[k][j] -= factor * I[i][j]
+        return I
+    except IndexError:
+        return None
+
+# =====================================================================
+# PARSERS Y GESTIÓN DE ARCHIVOS
+# =====================================================================
 def parse_rinex_obs_completo(path):
     obs = {}
     sys_idx = {}
@@ -95,8 +148,7 @@ def parse_rinex_obs_completo(path):
             if in_h:
                 if "SYS / # / OBS TYPES" in line:
                     sys_char = line[0].strip()
-                    if sys_char:
-                        last_sys_char = sys_char
+                    if sys_char: last_sys_char = sys_char
                     if last_sys_char:
                         tokens = [x.strip() for x in line[6:60].split() if x.strip()]
                         sys_tokens.setdefault(last_sys_char, []).extend(tokens)
@@ -120,9 +172,7 @@ def parse_rinex_obs_completo(path):
             elif tow and len(line) > 3 and line[0] in 'GRECSJ':
                 sys_char = line[0]
                 idx_c1 = sys_idx.get(sys_char, {}).get('C1', -1)
-                idx_l1 = sys_idx.get(sys_char, {}).get('L1', -1)
                 idx_c5 = sys_idx.get(sys_char, {}).get('C5', -1)
-                idx_l5 = sys_idx.get(sys_char, {}).get('L5', -1)
                 idx_s1 = sys_idx.get(sys_char, {}).get('S1', -1)
                 idx_s5 = sys_idx.get(sys_char, {}).get('S5', -1)
                 
@@ -130,15 +180,9 @@ def parse_rinex_obs_completo(path):
                 if idx_c1 >= 0 and len(line) >= 17 + 16 * idx_c1:
                     v = line[3+16*idx_c1 : 17+16*idx_c1].strip()
                     if v: data['C1'] = float(v.replace('D', 'E').replace('d', 'e'))
-                if idx_l1 >= 0 and len(line) >= 17 + 16 * idx_l1:
-                    v = line[3+16*idx_l1 : 17+16*idx_l1].strip()
-                    if v: data['L1'] = float(v.replace('D', 'E').replace('d', 'e'))
                 if idx_c5 >= 0 and len(line) >= 17 + 16 * idx_c5:
                     v = line[3+16*idx_c5 : 17+16*idx_c5].strip()
                     if v: data['C5'] = float(v.replace('D', 'E').replace('d', 'e'))
-                if idx_l5 >= 0 and len(line) >= 17 + 16 * idx_l5:
-                    v = line[3+16*idx_l5 : 17+16*idx_l5].strip()
-                    if v: data['L5'] = float(v.replace('D', 'E').replace('d', 'e'))
                 if idx_s1 >= 0 and len(line) >= 17 + 16 * idx_s1:
                     v = line[3+16*idx_s1 : 17+16*idx_s1].strip()
                     if v: data['S1'] = float(v.replace('D', 'E').replace('d', 'e'))
@@ -150,11 +194,8 @@ def parse_rinex_obs_completo(path):
                 valid_l5 = 'C5' in data and data['C5'] > 15000000.0
                 
                 if valid_l1 or valid_l5:
-                    if not valid_l1:
-                        data.pop('C1', None); data.pop('L1', None); data.pop('S1', None)
-                    if not valid_l5:
-                        data.pop('C5', None); data.pop('L5', None); data.pop('S5', None)
-                        
+                    if not valid_l1: data.pop('C1', None); data.pop('S1', None)
+                    if not valid_l5: data.pop('C5', None); data.pop('S5', None)
                     obs.setdefault(tow, {})[line[0:3].strip()] = data
     return obs
 
@@ -162,8 +203,7 @@ def interpolar_base_a_rover(obs_base, tr, max_gap=0.05):
     tiempos_base = sorted(list(obs_base.keys()))
     if not tiempos_base: return None
     idx = min(range(len(tiempos_base)), key=lambda i: abs(tiempos_base[i] - tr))
-    if abs(tiempos_base[idx] - tr) <= max_gap: 
-        return obs_base[tiempos_base[idx]].copy()
+    if abs(tiempos_base[idx] - tr) <= max_gap: return obs_base[tiempos_base[idx]].copy()
     return None
 
 def generar_rinex_sincronizado(raw_path, out_path, obs_dict):
@@ -191,17 +231,129 @@ def generar_rinex_sincronizado(raw_path, out_path, obs_dict):
             sats = [k for k in obs_dict[tow].keys() if k != '_meta']
             f_out.write(f"> {y} {m:02d} {d:02d} {h:02d} {mn:02d} {sec:11.7f}  0 {len(sats):2d}\n")
             for sat in sats:
-                c1, l1 = obs_dict[tow][sat].get('C1', 0.0), obs_dict[tow][sat].get('L1', 0.0)
-                c5, l5 = obs_dict[tow][sat].get('C5', 0.0), obs_dict[tow][sat].get('L5', 0.0)
+                c1 = obs_dict[tow][sat].get('C1', 0.0)
+                c5 = obs_dict[tow][sat].get('C5', 0.0)
                 c1_s = f"{c1:14.3f}" if c1 > 0 else "              "
-                l1_s = f"{l1:14.3f}" if l1 > 0 else "              "
                 c5_s = f"{c5:14.3f}" if c5 > 0 else "              "
-                l5_s = f"{l5:14.3f}" if l5 > 0 else "              "
-                f_out.write(f"{sat}{c1_s}  {l1_s}  {c5_s}  {l5_s}  \n")
+                f_out.write(f"{sat}{c1_s}                  {c5_s}                  \n")
+
+def obtener_fecha_obs(filepath):
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            if line.startswith('>'):
+                partes = line[1:].strip().split()
+                if len(partes) >= 6: 
+                    try:
+                        y = int(partes[0])
+                        return (y if y>100 else y+2000), int(partes[1]), int(partes[2]), int(partes[3]), int(partes[4]), float(partes[5])
+                    except: pass
+    return None
+
+# =====================================================================
+# PRODUCTOS IGS Y MODELOS ORBITALES
+# =====================================================================
+def descargar_productos_igs_stream(year, month, day, hour):
+    dt = datetime.datetime(year, month, day)
+    doy = dt.timetuple().tm_yday
+    week, dow = get_gps_week_dow(year, month, day)
+    
+    nav_descargado = os.path.join(UPLOAD_FOLDER, f"auto_nav_{year}_{doy:03d}.nav")
+    sp3_descargado_z = os.path.join(UPLOAD_FOLDER, f"igu{week}{dow}_00.sp3.Z")
+    sp3_descargado = os.path.join(UPLOAD_FOLDER, f"igu{week}{dow}_00.sp3")
+    
+    ctx = ssl.create_default_context()
+    
+    if not os.path.exists(nav_descargado):
+        urls_nav = [f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00IGS_R_{year}{doy:03d}0000_01D_MN.rnx.gz"]
+        for url in urls_nav:
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, context=ctx, timeout=10) as res:
+                    yield ("INFO", f"> Descargando Efemérides Broadcast NAV: {url.split('/')[-1]}...\n")
+                    with open(nav_descargado + '.gz', 'wb') as f: f.write(res.read())
+                    with gzip.open(nav_descargado + '.gz', 'rb') as f_in, open(nav_descargado, 'wb') as f_out: shutil.copyfileobj(f_in, f_out)
+                    yield ("SUCCESS_NAV", nav_descargado)
+                    break
+            except Exception: pass
+
+    if not os.path.exists(sp3_descargado):
+        hrs = ['00', '06', '12', '18']
+        for hr in hrs:
+            url_sp3 = f"https://igs.bkg.bund.de/root_ftp/IGS/products/{week}/igu{week}{dow}_{hr}.sp3.Z"
+            try:
+                req = urllib.request.Request(url_sp3, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, context=ctx, timeout=10) as res:
+                    yield ("INFO", f"> Descargando Órbitas Ultra-Rápidas SP3: {url_sp3.split('/')[-1]}...\n")
+                    with open(sp3_descargado_z, 'wb') as f: f.write(res.read())
+                    yield ("INFO", "> Extrayendo archivo .Z mediante sub-rutina Unix...\n")
+                    subprocess.run(["gzip", "-d", "-f", sp3_descargado_z], check=False)
+                    if os.path.exists(sp3_descargado):
+                        yield ("SUCCESS_SP3", sp3_descargado)
+                        break
+            except Exception: pass
+    yield ("END", "Proceso de captura IGS finalizado.\n")
+
+def parse_sp3_preciso(path):
+    sp3_data = {}
+    if not path or not os.path.exists(path): return sp3_data
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        current_time = None
+        for line in f:
+            if line.startswith('* '):
+                p = line.split()
+                if len(p) >= 7:
+                    try:
+                        y, m, d, h, mn, s = int(p[1]), int(p[2]), int(p[3]), int(p[4]), int(p[5]), float(p[6])
+                        current_time = gps_time_to_tow(y, m, d, h, mn, s)
+                    except: pass
+            elif line.startswith('P') and current_time:
+                sys_char = line[1]
+                if sys_char in 'GECR':
+                    sat_id = line[1:4].strip()
+                    try:
+                        x = float(line[4:18]) * 1000.0
+                        y = float(line[18:32]) * 1000.0
+                        z = float(line[32:46]) * 1000.0
+                        clk = float(line[46:60]) / 1e6 if len(line)>46 and line[46:60].strip() else 0.0
+                        sp3_data.setdefault(sat_id, []).append((current_time, x, y, z, clk))
+                    except: pass
+    for sat in sp3_data: sp3_data[sat].sort(key=lambda item: item[0])
+    return sp3_data
+
+def lagrange_interpolate(x, x_pts, y_pts):
+    n = len(x_pts)
+    val = 0.0
+    for i in range(n):
+        p = 1.0
+        for j in range(n):
+            if i != j: p *= (x - x_pts[j]) / (x_pts[i] - x_pts[j])
+        val += y_pts[i] * p
+    return val
+
+def interpolate_sp3(sp3_data, sat, t_emision, degree=9):
+    if sat not in sp3_data: return None
+    data = sp3_data[sat]
+    if len(data) < degree + 1: return None
+    idx = min(range(len(data)), key=lambda i: abs(data[i][0] - t_emision))
+    half = degree // 2
+    start = max(0, idx - half)
+    end = min(len(data), start + degree + 1)
+    if end - start < degree + 1: start = max(0, end - degree - 1)
+    pts = data[start:end]
+    
+    t_pts = [p[0] for p in pts]; x_pts = [p[1] for p in pts]
+    y_pts = [p[2] for p in pts]; z_pts = [p[3] for p in pts]
+    clk_pts = [p[4] for p in pts]
+    
+    x = lagrange_interpolate(t_emision, t_pts, x_pts)
+    y = lagrange_interpolate(t_emision, t_pts, y_pts)
+    z = lagrange_interpolate(t_emision, t_pts, z_pts)
+    clk = lagrange_interpolate(t_emision, t_pts, clk_pts)
+    return (x, y, z, clk)
 
 def parse_rinex_nav_real(path):
-    ephemeris = {}
-    iono_params = {'GPSA': [0]*4, 'GPSB': [0]*4, 'BDSA': [0]*4, 'BDSB': [0]*4}
+    ephemeris = {'_iono': {'alpha': [0]*4, 'beta': [0]*4}}
+    if not path or not os.path.exists(path): return ephemeris
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
         in_h, sat, data = True, None, []
         for line in f:
@@ -213,9 +365,9 @@ def parse_rinex_nav_real(path):
                         try:
                             chunk = line[5+i*12 : 5+(i+1)*12].strip().replace('D', 'E').replace('d', 'e')
                             vals.append(float(chunk) if chunk else 0.0)
-                        except:
-                            vals.append(0.0)
-                    if sys_type in iono_params: iono_params[sys_type] = vals
+                        except: vals.append(0.0)
+                    if sys_type == 'GPSA': ephemeris['_iono']['alpha'] = vals
+                    elif sys_type == 'GPSB': ephemeris['_iono']['beta'] = vals
                 elif "END OF HEADER" in line: in_h = False
                 continue
             if len(line) > 8 and line[0] in 'GECSJ' and line[1:3].isdigit():
@@ -227,74 +379,14 @@ def parse_rinex_nav_real(path):
                 data.extend([float(line[i:i+19].replace('D','E').replace('d','e').strip()) for i in range(4, 80, 19) if line[i:i+19].strip()])
         if sat and len(data) >= 20: 
             ephemeris.setdefault(sat, []).append({'af0':data[0],'af1':data[1],'af2':data[2],'Crs':data[4],'Delta_n':data[5],'M0':data[6],'Cuc':data[7],'e':data[8],'Cus':data[9],'sqrtA':data[10],'Toe':data[11],'Cic':data[12],'OMEGA':data[13],'Cis':data[14],'i0':data[15],'Crc':data[16],'omega':data[17],'OMEGA_DOT':data[18],'IDOT':data[19]})
-    alpha = iono_params['GPSA'] if any(iono_params['GPSA']) else iono_params['BDSA']
-    beta = iono_params['GPSB'] if any(iono_params['GPSB']) else iono_params['BDSB']
-    ephemeris['_iono'] = {'alpha': alpha, 'beta': beta}
     return ephemeris
 
 def seleccionar_efemeride_optima(eph_list, t_target):
     if not eph_list: return None
     return min(eph_list, key=lambda x: abs(x.get('Toe', 0) - t_target))
 
-def obtener_fecha_obs(filepath):
-    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-        for line in f:
-            if line.startswith('>'):
-                partes = line[1:].strip().split()
-                if len(partes) >= 6: 
-                    try:
-                        year = int(partes[0])
-                        if year < 100: year += 2000
-                        return year, int(partes[1]), int(partes[2]), int(partes[3]), int(partes[4]), float(partes[5])
-                    except: pass
-    return None
-
-def descargar_productos_igs_stream(year, month, day, hour):
-    dt = datetime.datetime(year, month, day)
-    doy = dt.timetuple().tm_yday
-    week, dow = get_gps_week_dow(year, month, day)
-    
-    nav_descargado = os.path.join(UPLOAD_FOLDER, f"auto_nav_{year}_{doy:03d}.nav")
-    sp3_descargado = os.path.join(UPLOAD_FOLDER, f"igu_{week}_{dow}.sp3")
-    ionex_descargado = os.path.join(UPLOAD_FOLDER, f"cod_{doy}.yyi")
-    
-    ctx = ssl.create_default_context()
-    
-    # 1. Descarga NAV (Respaldo)
-    if not os.path.exists(nav_descargado):
-        prefijos = ['IGS', 'WRD', 'BKG', 'GOP']
-        urls_nav = [f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00{p}_R_{year}{doy:03d}0000_01D_MN.rnx.gz" for p in prefijos]
-        for url in urls_nav:
-            try:
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, context=ctx, timeout=5) as res:
-                    yield ("INFO", f"> Descargando Efemérides NAV: {url.split('/')[-1]}...\n")
-                    with open(nav_descargado + '.gz', 'wb') as f: f.write(res.read())
-                    with gzip.open(nav_descargado + '.gz', 'rb') as f_in, open(nav_descargado, 'wb') as f_out: shutil.copyfileobj(f_in, f_out)
-                    yield ("SUCCESS_NAV", nav_descargado)
-                    break
-            except Exception: pass
-
-    # 2. Descarga SP3 Ultra-Rápido
-    if not os.path.exists(sp3_descargado):
-        hrs = ['00', '06', '12', '18']
-        for hr in hrs:
-            url_sp3 = f"https://igs.bkg.bund.de/root_ftp/IGS/products/{week}/igu{week}{dow}_{hr}.sp3.Z"
-            try:
-                req = urllib.request.Request(url_sp3, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, context=ctx, timeout=5) as res:
-                    yield ("INFO", f"> Descargando Órbitas Ultra-Rápidas SP3: {url_sp3.split('/')[-1]}...\n")
-                    # Soporte de descompresión Unix .Z pendiente en backend nativo Python. 
-                    # El módulo buscará y asimilará el SP3 si se decodifica con éxito.
-                    with open(sp3_descargado, 'wb') as f: f.write(res.read())
-                    yield ("SUCCESS_SP3", sp3_descargado)
-                    break
-            except Exception: pass
-
-    yield ("END", "Proceso de captura IGS finalizado.\n")
-
 # =====================================================================
-# MODELOS GEODÉSICOS
+# GEODESIA Y CORRECCIONES ATMOSFÉRICAS
 # =====================================================================
 def calcular_saastamoinen(lat_deg, alt, elev_deg):
     if elev_deg < 5.0: elev_deg = 5.0
@@ -416,52 +508,64 @@ def calcular_posicion_satelite_wgs84(eph, t_emision, tau_vuelo, sys_char='G'):
     return (xs * math.cos(theta) + ys * math.sin(theta), -xs * math.sin(theta) + ys * math.cos(theta), zs, dt_sat)
 
 # =====================================================================
-# EL CORAZÓN DE PROCESAMIENTO DGPS Y ACELERADOR NUMPY (PPK PREP)
+# EL CORAZÓN DE PROCESAMIENTO DGPS (PYTHON PURO)
 # =====================================================================
 def aislar_diferencias_simples_ppk(obs_b, obs_r):
     sd_suavizada = {}
     for tow in sorted(list(obs_r.keys())):
         if tow not in obs_b: continue
-        
         sd_epoca = {'_meta': obs_r[tow]['_meta']}
         for s, d_r in obs_r[tow].items():
             if s == '_meta' or s not in obs_b[tow]: continue
             d_b = obs_b[tow]
-            
             pr_b = d_b[s].get('C1') or d_b[s].get('C5')
             pr_r = d_r.get('C1') or d_r.get('C5')
-            
             if not pr_b or not pr_r: continue
             
             snr_b = d_b[s].get('S1') or d_b[s].get('S5', 30.0)
             snr_r = d_r.get('S1') or d_r.get('S5', 30.0)
             
-            sd_P = pr_r - pr_b
-            
-            sd_epoca[s] = {
-                'sd_P': sd_P,
-                'pr_b': pr_b, 'pr_r': pr_r,
-                'snr': min(snr_b, snr_r)
-            }
+            sd_epoca[s] = {'sd_P': pr_r - pr_b, 'pr_b': pr_b, 'pr_r': pr_r, 'snr': min(snr_b, snr_r)}
         if len(sd_epoca) > 1: sd_suavizada[tow] = sd_epoca
     return sd_suavizada
 
-def calcular_dd_ppk_lambda_epoca(sd_epoca, nav, X_b, Y_b, Z_b, tr, mask_angle, snr_mask=25.0):
+def calcular_dd_ppk_lambda_epoca(sd_epoca, nav, sp3, X_b, Y_b, Z_b, tr, mask_angle, snr_mask=25.0):
     try:
         X_iter, Y_iter, Z_iter = X_b, Y_b, Z_b 
         lat_b, lon_b, alt_b = ecef_a_geodesicas(X_b, Y_b, Z_b)
         
-        iono = nav.get('_iono', {'alpha': [0]*4, 'beta': [0]*4})
-        alpha, beta = iono['alpha'], iono['beta']
+        alpha = nav.get('_iono', {}).get('alpha', [0]*4)
+        beta = nav.get('_iono', {}).get('beta', [0]*4)
         
         sat_positions = {}
         for s, d in sd_epoca.items():
             if s == '_meta' or d['sd_P'] is None: continue 
             tau_r = d['pr_r'] / C_LIGHT
             tau_b = d['pr_b'] / C_LIGHT
+            t_emision_r = tr - tau_r
+            t_emision_b = tr - tau_b
             
-            sp_r = calcular_posicion_satelite_wgs84(seleccionar_efemeride_optima(nav.get(s), tr-tau_r), tr-tau_r, tau_r, s[0])
-            sp_b = calcular_posicion_satelite_wgs84(seleccionar_efemeride_optima(nav.get(s), tr-tau_b), tr-tau_b, tau_b, s[0])
+            sp_r, sp_b = None, None
+            
+            # --- Inyección SP3: Híbrido de Seguridad ---
+            if sp3 and s in sp3:
+                sp3_res_r = interpolate_sp3(sp3, s, t_emision_r)
+                sp3_res_b = interpolate_sp3(sp3, s, t_emision_b)
+                if sp3_res_r and sp3_res_b:
+                    theta_r = OMEGA_E * tau_r
+                    xs_r = sp3_res_r[0] * math.cos(theta_r) + sp3_res_r[1] * math.sin(theta_r)
+                    ys_r = -sp3_res_r[0] * math.sin(theta_r) + sp3_res_r[1] * math.cos(theta_r)
+                    sp_r = (xs_r, ys_r, sp3_res_r[2], sp3_res_r[3])
+                    
+                    theta_b = OMEGA_E * tau_b
+                    xs_b = sp3_res_b[0] * math.cos(theta_b) + sp3_res_b[1] * math.sin(theta_b)
+                    ys_b = -sp3_res_b[0] * math.sin(theta_b) + sp3_res_b[1] * math.cos(theta_b)
+                    sp_b = (xs_b, ys_b, sp3_res_b[2], sp3_res_b[3])
+            
+            # Fallback a Efeméride Transmitida si SP3 falla o no cubre el satélite
+            if not sp_r or not sp_b:
+                sp_r = calcular_posicion_satelite_wgs84(seleccionar_efemeride_optima(nav.get(s), t_emision_r), t_emision_r, tau_r, s[0])
+                sp_b = calcular_posicion_satelite_wgs84(seleccionar_efemeride_optima(nav.get(s), t_emision_b), t_emision_b, tau_b, s[0])
             
             if sp_r and sp_b:
                 el_r, az_r = calcular_topocentricas(sp_r[0], sp_r[1], sp_r[2], X_iter, Y_iter, Z_iter)
@@ -502,9 +606,7 @@ def calcular_dd_ppk_lambda_epoca(sd_epoca, nav, X_b, Y_b, Z_b, tr, mask_angle, s
         for iteracion in range(8):
             lat_it, lon_it, alt_it = ecef_a_geodesicas(X_iter, Y_iter, Z_iter)
             
-            H = []      
-            L = []      
-            W_diag = [] 
+            H = []; L = []; W_diag = []
             
             c_ref = {}
             for c, r_sat in ref_sats.items():
@@ -513,14 +615,7 @@ def calcular_dd_ppk_lambda_epoca(sd_epoca, nav, X_b, Y_b, Z_b, tr, mask_angle, s
                 rho_r, iono_r, dist_r = calc_rho(r_data['sp_r'], X_iter, Y_iter, Z_iter, lat_it, lon_it, alt_it, el_r, az_r)
                 
                 SD_P_calc_ref = (rho_r + iono_r) - base_calcs[r_sat]
-                c_ref[c] = {
-                    'dist_r': dist_r,
-                    'SD_P_calc_ref': SD_P_calc_ref,
-                    'sp_r': r_data['sp_r'],
-                    'el_r': el_r,
-                    'snr': r_data['snr'],
-                    'sd_P': r_data['sd_P']
-                }
+                c_ref[c] = {'dist_r': dist_r, 'SD_P_calc_ref': SD_P_calc_ref, 'sp_r': r_data['sp_r'], 'el_r': el_r, 'snr': r_data['snr'], 'sd_P': r_data['sd_P']}
             
             res_idx = 0
             for i, s in enumerate(sat_list):
@@ -552,42 +647,35 @@ def calcular_dd_ppk_lambda_epoca(sd_epoca, nav, X_b, Y_b, Z_b, tr, mask_angle, s
                 
                 L.append([res_P])
                 H.append(dx_geom)
-                
-                if iteracion == 0:
-                    w_P = w_i_ref * 1.0
-                else:
-                    w_P = w_i_ref * 1.0 / max(1.0, abs(prev_residuals[res_idx]) / 2.0)
+                w_P = w_i_ref * 1.0 if iteracion == 0 else w_i_ref * 1.0 / max(1.0, abs(prev_residuals[res_idx]) / 2.0)
                 W_diag.append(w_P)
                 res_idx += 1
 
-            # --- INYECCIÓN SCIPY / NUMPY: ACELERACIÓN DE MATRICES Y EKF FLOAT ---
-            if not H or not W_diag: return None, "FAILED" 
+            # MATRIZ N x N (PYTHON PURO)
+            H_T = transpose_matrix(H)
+            if not H_T or not W_diag: return None, "FAILED" 
             
             try:
-                H_np = np.array(H)
-                L_np = np.array(L)
-                W_np = np.diag(W_diag)
+                H_T_W = [[H_T[r][idx] * W_diag[idx] for idx in range(len(W_diag))] for r in range(len(H_T))]
+            except IndexError: return None, "FAILED"
+
+            N_mat = matmul(H_T_W, H)
+            U_vec = matmul(H_T_W, L)
+            Q = invert_matrix_nxn(N_mat)
+            if not Q: return None, "FAILED"
+            
+            Delta_X = matmul(Q, U_vec)
+            if not Delta_X or len(Delta_X) < 3 or not Delta_X[0]: return None, "FAILED" 
+
+            X_iter += Delta_X[0][0]; Y_iter += Delta_X[1][0]; Z_iter += Delta_X[2][0]
                 
-                H_T_W = H_np.T @ W_np
-                N_mat = H_T_W @ H_np
-                U_vec = H_T_W @ L_np
-                
-                Q = np.linalg.inv(N_mat)
-                Delta_X = Q @ U_vec
-                
-                X_iter += Delta_X[0][0]
-                Y_iter += Delta_X[1][0]
-                Z_iter += Delta_X[2][0]
-                
-                prev_residuals = []
-                for r in range(len(H)):
-                    v_val = np.sum(H_np[r] * Delta_X.flatten()) - L_np[r][0]
-                    prev_residuals.append(v_val)
-                
-                if max(abs(Delta_X[0][0]), abs(Delta_X[1][0]), abs(Delta_X[2][0])) < 1e-3:
-                    return (X_iter, Y_iter, Z_iter), "FLOAT"
-            except np.linalg.LinAlgError:
-                return None, "FAILED"
+            prev_residuals = []
+            for r in range(len(H)):
+                v_val = sum(H[r][idx] * Delta_X[idx][0] for idx in range(len(H[0]))) - L[r][0]
+                prev_residuals.append(v_val)
+            
+            if max(abs(Delta_X[0][0]), abs(Delta_X[1][0]), abs(Delta_X[2][0])) < 1e-3:
+                return (X_iter, Y_iter, Z_iter), "FLOAT"
                 
         return (X_iter, Y_iter, Z_iter), "FLOAT"
     except Exception as e:
@@ -599,9 +687,7 @@ def calcular_dd_ppk_lambda_epoca(sd_epoca, nav, X_b, Y_b, Z_b, tr, mask_angle, s
 def estadistica_desacoplada(coordenadas, conf_plani, conf_alti, err_hor_max, err_ver_max):
     if not coordenadas: return None, None, None, 0, 0, 0, 0, 0.0
 
-    N_list = [c[0] for c in coordenadas]
-    E_list = [c[1] for c in coordenadas]
-    Z_list = [c[2] for c in coordenadas]
+    N_list = [c[0] for c in coordenadas]; E_list = [c[1] for c in coordenadas]; Z_list = [c[2] for c in coordenadas]
 
     def get_median(lst):
         s = sorted(lst); n = len(s)
@@ -614,9 +700,7 @@ def estadistica_desacoplada(coordenadas, conf_plani, conf_alti, err_hor_max, err
     for c in coordenadas:
         dh = math.hypot(c[0] - med_N, c[1] - med_E)
         dv = abs(c[2] - med_Z)
-        
-        if (err_hor_max > 0.0 and dh > err_hor_max) or (err_ver_max > 0.0 and dv > err_ver_max):
-            continue
+        if (err_hor_max > 0.0 and dh > err_hor_max) or (err_ver_max > 0.0 and dv > err_ver_max): continue
         valid_coords.append(c)
 
     if not valid_coords: return None, None, None, 0, 0, 0, 0, 0.0
@@ -637,18 +721,11 @@ def estadistica_desacoplada(coordenadas, conf_plani, conf_alti, err_hor_max, err
 
     if not final_coords: return None, None, None, 0, 0, 0, 0, 0.0
 
-    N_f = [c[0] for c in final_coords]
-    E_f = [c[1] for c in final_coords]
-    Z_f = [c[2] for c in final_coords]
+    N_f = [c[0] for c in final_coords]; E_f = [c[1] for c in final_coords]; Z_f = [c[2] for c in final_coords]
     f_v = [c[3] for c in final_coords if len(c) > 3 and c[3] == "FIXED"]
 
     fix_ratio = (len(f_v) / len(final_coords)) * 100 if final_coords else 0.0
-    
-    len_f = max(1, len(final_coords))
-    med_N_f = get_median(N_f)
-    med_E_f = get_median(E_f)
-    med_Z_f = get_median(Z_f)
-    return med_N_f, med_E_f, med_Z_f, N_s, E_s, Z_s, len(final_coords), fix_ratio
+    return get_median(N_f), get_median(E_f), get_median(Z_f), N_s, E_s, Z_s, len(final_coords), fix_ratio
 
 # =====================================================================
 # GENERADORES DE INFORMES (FRONTEND)
@@ -698,7 +775,7 @@ def generar_informe_homogeneizacion_detallado(base_name, rover_name, base_raw, r
     return informe
 
 def generar_informe_ascii(tipo, p_dict):
-    estado_sol = 'FLOAT (DGPS)'
+    estado_sol = 'FLOAT (DGPS + SP3)'
     
     err_h_str = f"± {f_14(p_dict['err_h'])} m (Vinculante)" if p_dict['err_h'] > 0 else 'Inactiva'
     err_v_str = f"± {f_14(p_dict['err_v'])} m (Vinculante)" if p_dict['err_v'] > 0 else 'Inactiva'
@@ -729,6 +806,7 @@ def generar_informe_ascii(tipo, p_dict):
 [2] ESTRATEGIA MATEMÁTICA Y ESTADÍSTICA
 ------------------------------------------------------------------------
   [-] Motor Algorítmico      : Diferencias Dobles Pseudodistancia C1/C5
+  [-] Órbitas Satelitales    : SP3 Interpolación Lagrange (Si aplica)
   [-] Resolución Matriz      : Ajuste IRLS Mínimos Cuadrados
   [-] Sincronización Épocas  : Emparejamiento Dinámico Estricto
 
@@ -821,7 +899,7 @@ def tab2_efemerides():
             ft = obtener_fecha_obs(bp)
             if not ft: yield "> [ERROR FATAL] Imposible extraer la fecha.\n"; return
             
-            nav_p, sp3_p, ionex_p = None, None, None
+            nav_p, sp3_p = None, None
             descarga_exitosa = False
             
             for tipo, log in descargar_productos_igs_stream(ft[0], ft[1], ft[2], ft[3]):
@@ -867,6 +945,7 @@ def tab3_calibrar():
                 yield "> [ERROR] Coordenadas Base y Rover (Calibración) son requeridas.\n"; return
             
             nav_path = leer_estado('nav_path')
+            sp3_path = leer_estado('sp3_path')
             p_b_h = leer_estado('base_calib_homo')
             p_r_h = leer_estado('rover_calib_homo')
 
@@ -876,6 +955,9 @@ def tab3_calibrar():
             obs_b_raw = parse_rinex_obs_completo(p_b_h)
             obs_r_raw = parse_rinex_obs_completo(p_r_h)
             nav = parse_rinex_nav_real(nav_path)
+            sp3 = parse_sp3_preciso(sp3_path) if sp3_path else {}
+            
+            if sp3: yield "[PROGRESO] Matrices de Órbita Ultra-Rápida SP3 ensambladas en memoria...\n"
             
             yield "[PROGRESO] Re-ensamblando Malla Temporal de Calibración...\n"
             sd_suavizada = aislar_diferencias_simples_ppk(obs_b_raw, obs_r_raw)
@@ -892,7 +974,7 @@ def tab3_calibrar():
             
             coords_raw = []
             for t in t_sample:
-                sem, status = calcular_dd_ppk_lambda_epoca(sd_suavizada[t], nav, X_b, Y_b, Z_b, t, 10.0, p_snr)
+                sem, status = calcular_dd_ppk_lambda_epoca(sd_suavizada[t], nav, sp3, X_b, Y_b, Z_b, t, 10.0, p_snr)
                 if sem:
                     X_ri, Y_ri, Z_ri = sem
                     la, lo, al = ecef_a_geodesicas(X_ri, Y_ri, Z_ri)
@@ -905,8 +987,7 @@ def tab3_calibrar():
             deltas_h = [math.hypot(c[0] - utm_n_r, c[1] - utm_e_r) for c in coords_raw]
             deltas_v = [abs(c[2] - utm_c_r) for c in coords_raw]
             
-            deltas_h.sort()
-            deltas_v.sort()
+            deltas_h.sort(); deltas_v.sort()
             
             def get_mad(data):
                 if not data: return 0.0, 0.0
@@ -941,8 +1022,7 @@ def tab3_calibrar():
                 obs_b_full = parse_rinex_obs_completo(p_b_raw)
                 obs_r_full = parse_rinex_obs_completo(p_r_raw)
             else:
-                obs_b_full = obs_b_raw
-                obs_r_full = obs_r_raw
+                obs_b_full = obs_b_raw; obs_r_full = obs_r_raw
                 
             rover_tows_full = sorted(list(obs_r_full.keys()))
             base_tows_full = sorted(list(obs_b_full.keys()))
@@ -977,7 +1057,7 @@ def tab3_calibrar():
                         for snr in set(snr_grid):
                             coords = []
                             for t in t_samp:
-                                sem, status = calcular_dd_ppk_lambda_epoca(sd_suav[t], nav, X_b, Y_b, Z_b, t, m, snr)
+                                sem, status = calcular_dd_ppk_lambda_epoca(sd_suav[t], nav, sp3, X_b, Y_b, Z_b, t, m, snr)
                                 if sem:
                                     X_ri, Y_ri, Z_ri = sem
                                     la, lo, al = ecef_a_geodesicas(X_ri, Y_ri, Z_ri)
@@ -1077,6 +1157,7 @@ def tab4_procesar():
                 yield "> [ERROR] Coordenadas Base incompletas.\n"; return
             
             nav_path = leer_estado('nav_path')
+            sp3_path = leer_estado('sp3_path')
             p_b_raw = leer_estado('base_raw') 
 
             if not nav_path or not p_b_raw or not os.path.exists(p_b_raw): 
@@ -1085,6 +1166,9 @@ def tab4_procesar():
             obs_b_raw = parse_rinex_obs_completo(p_b_raw)
             obs_r_raw = parse_rinex_obs_completo(p_r_nuevo) 
             nav = parse_rinex_nav_real(nav_path)
+            sp3 = parse_sp3_preciso(sp3_path) if sp3_path else {}
+            
+            if sp3: yield "[PROGRESO] Órbitas Precisas SP3 acopladas con éxito...\n"
             
             yield f"[PROGRESO] Emparejamiento Temporal Dinámico contra la Base Pivote (Tolerancia {f_14(p_max_gap)}s)...\n"
             rover_tows = sorted(list(obs_r_raw.keys()))
@@ -1115,7 +1199,7 @@ def tab4_procesar():
                 if t_eps > 0 and c % max(1, t_eps // 10) == 0: 
                     yield f"[PROGRESO] Resolviendo Ecuaciones Matriciales DGPS... {int((c / t_eps) * 100)}%\n"
                 
-                sem, status = calcular_dd_ppk_lambda_epoca(sd_suavizada[t], nav, X_b, Y_b, Z_b, t, p_mask, p_snr)
+                sem, status = calcular_dd_ppk_lambda_epoca(sd_suavizada[t], nav, sp3, X_b, Y_b, Z_b, t, p_mask, p_snr)
                 if not sem: continue
                 X_ri, Y_ri, Z_ri = sem
                 la, lo, al = ecef_a_geodesicas(X_ri, Y_ri, Z_ri)
@@ -1153,6 +1237,5 @@ def tab4_procesar():
     return Response(procesar(), mimetype='text/plain')
 
 if __name__ == '__main__':
-    # SE MODIFICÓ EL PUERTO A 6000 A SOLICITUD DEL OPERADOR PARA EVITAR CONFLICTOS LOCALES
+    # PUERTO 6000 A SOLICITUD DEL OPERADOR PARA AISLAR ENTORNO LOCAL
     app.run(host='0.0.0.0', port=6000, debug=True)
-
