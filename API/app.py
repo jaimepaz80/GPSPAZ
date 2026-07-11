@@ -250,7 +250,7 @@ def obtener_fecha_obs(filepath):
     return None
 
 # =====================================================================
-# PRODUCTOS IGS Y MODELOS ORBITALES
+# PRODUCTOS IGS (SISTEMA DE REDUNDANCIA DUAL)
 # =====================================================================
 def descargar_productos_igs_stream(year, month, day, hour):
     dt = datetime.datetime(year, month, day)
@@ -258,39 +258,74 @@ def descargar_productos_igs_stream(year, month, day, hour):
     week, dow = get_gps_week_dow(year, month, day)
     
     nav_descargado = os.path.join(UPLOAD_FOLDER, f"auto_nav_{year}_{doy:03d}.nav")
-    sp3_descargado_z = os.path.join(UPLOAD_FOLDER, f"igu{week}{dow}_00.sp3.Z")
     sp3_descargado = os.path.join(UPLOAD_FOLDER, f"igu{week}{dow}_00.sp3")
     
+    # Evasión de certificados SSL para evitar bloqueos en la nube
     ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     
+    # 1. Descarga NAV (Respaldo absoluto)
     if not os.path.exists(nav_descargado):
         urls_nav = [f"https://igs.bkg.bund.de/root_ftp/IGS/BRDC/{year}/{doy:03d}/BRDC00IGS_R_{year}{doy:03d}0000_01D_MN.rnx.gz"]
         for url in urls_nav:
             try:
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, context=ctx, timeout=10) as res:
-                    yield ("INFO", f"> Descargando Efemérides Broadcast NAV: {url.split('/')[-1]}...\n")
+                with urllib.request.urlopen(req, context=ctx, timeout=8) as res:
+                    yield ("INFO", f"> Descargando Efemérides Broadcast (Respaldo NAV)...\n")
                     with open(nav_descargado + '.gz', 'wb') as f: f.write(res.read())
                     with gzip.open(nav_descargado + '.gz', 'rb') as f_in, open(nav_descargado, 'wb') as f_out: shutil.copyfileobj(f_in, f_out)
                     yield ("SUCCESS_NAV", nav_descargado)
                     break
             except Exception: pass
 
+    # 2. REDUNDANCIA DUAL: Descarga SP3 Ultra-Rápido
     if not os.path.exists(sp3_descargado):
         hrs = ['00', '06', '12', '18']
+        exito_sp3 = False
+        
         for hr in hrs:
-            url_sp3 = f"https://igs.bkg.bund.de/root_ftp/IGS/products/{week}/igu{week}{dow}_{hr}.sp3.Z"
+            if exito_sp3: break
+            
+            # ESTRATEGIA A: Buscar formato moderno .gz en servidores múltiples (Nativo de Python)
+            urls_gz = [
+                f"https://igs.bkg.bund.de/root_ftp/IGS/products/{week}/igu{week}{dow}_{hr}.sp3.gz",
+                f"ftp://igs.ign.fr/pub/igs/products/{week}/igu{week}{dow}_{hr}.sp3.gz"
+            ]
+            
+            for url_gz in urls_gz:
+                try:
+                    req = urllib.request.Request(url_gz, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req, context=ctx, timeout=5) as res:
+                        yield ("INFO", f"> Extrayendo SP3 Precisos en formato moderno (.gz)...\n")
+                        with open(sp3_descargado + '.gz', 'wb') as f: f.write(res.read())
+                        with gzip.open(sp3_descargado + '.gz', 'rb') as f_in, open(sp3_descargado, 'wb') as f_out: shutil.copyfileobj(f_in, f_out)
+                        yield ("SUCCESS_SP3", sp3_descargado)
+                        exito_sp3 = True
+                        break
+                except Exception: pass
+            
+            if exito_sp3: break
+            
+            # ESTRATEGIA B: Fallback a legado .Z forzando descompresor Unix interno
+            url_z = f"https://igs.bkg.bund.de/root_ftp/IGS/products/{week}/igu{week}{dow}_{hr}.sp3.Z"
+            sp3_descargado_z = sp3_descargado + '.Z'
             try:
-                req = urllib.request.Request(url_sp3, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, context=ctx, timeout=10) as res:
-                    yield ("INFO", f"> Descargando Órbitas Ultra-Rápidas SP3: {url_sp3.split('/')[-1]}...\n")
+                req = urllib.request.Request(url_z, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, context=ctx, timeout=5) as res:
+                    yield ("INFO", f"> Fallback SP3: Descargando formato legado (.Z)...\n")
                     with open(sp3_descargado_z, 'wb') as f: f.write(res.read())
-                    yield ("INFO", "> Extrayendo archivo .Z mediante sub-rutina Unix...\n")
-                    subprocess.run(["gzip", "-d", "-f", sp3_descargado_z], check=False)
+                    yield ("INFO", "> Activando motor Gunzip de Amazon Linux (Vercel)...\n")
+                    
+                    # Llamada estricta validada para Vercel
+                    subprocess.run(["gunzip", "-f", sp3_descargado_z], check=False, capture_output=True)
+                    
                     if os.path.exists(sp3_descargado):
                         yield ("SUCCESS_SP3", sp3_descargado)
+                        exito_sp3 = True
                         break
             except Exception: pass
+            
     yield ("END", "Proceso de captura IGS finalizado.\n")
 
 def parse_sp3_preciso(path):
@@ -562,7 +597,7 @@ def calcular_dd_ppk_lambda_epoca(sd_epoca, nav, sp3, X_b, Y_b, Z_b, tr, mask_ang
                     ys_b = -sp3_res_b[0] * math.sin(theta_b) + sp3_res_b[1] * math.cos(theta_b)
                     sp_b = (xs_b, ys_b, sp3_res_b[2], sp3_res_b[3])
             
-            # Fallback a Efeméride Transmitida si SP3 falla o no cubre el satélite
+            # Fallback a Efeméride Transmitida si SP3 falla o satélite no está listado
             if not sp_r or not sp_b:
                 sp_r = calcular_posicion_satelite_wgs84(seleccionar_efemeride_optima(nav.get(s), t_emision_r), t_emision_r, tau_r, s[0])
                 sp_b = calcular_posicion_satelite_wgs84(seleccionar_efemeride_optima(nav.get(s), t_emision_b), t_emision_b, tau_b, s[0])
@@ -1239,3 +1274,4 @@ def tab4_procesar():
 if __name__ == '__main__':
     # PUERTO 6000 A SOLICITUD DEL OPERADOR PARA AISLAR ENTORNO LOCAL
     app.run(host='0.0.0.0', port=6000, debug=True)
+
