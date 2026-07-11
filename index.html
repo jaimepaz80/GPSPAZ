@@ -55,7 +55,7 @@
 
         <nav class="flex space-x-2 bg-gray-800 p-2 rounded mb-6" id="tabs-nav">
             <button onclick="switchTab(1)" id="btn-tab1" class="px-4 py-2 rounded bg-blue-600 font-bold text-sm sm:text-base">1. Datos Raw (Calibración)</button>
-            <button onclick="switchTab(2)" id="btn-tab2" class="px-4 py-2 rounded bg-gray-700 disabled-tab text-sm sm:text-base">2. Descarga IGS</button>
+            <button onclick="switchTab(2)" id="btn-tab2" class="px-4 py-2 rounded bg-gray-700 disabled-tab text-sm sm:text-base">2. Carga SP3/NAV</button>
             <button onclick="switchTab(3)" id="btn-tab3" class="px-4 py-2 rounded bg-gray-700 disabled-tab text-sm sm:text-base">3. Calibración Exacta</button>
             <button onclick="switchTab(4)" id="btn-tab4" class="px-4 py-2 rounded bg-gray-700 disabled-tab text-sm sm:text-base">4. Procesar Punto</button>
         </nav>
@@ -80,11 +80,25 @@
         </section>
 
         <section id="tab2" class="tab-content bg-gray-800 p-6 rounded shadow-lg">
-            <h2 class="text-xl mb-4 font-semibold border-b border-gray-600 pb-2">Efemérides Precisas y Mapas Ionosféricos (SP3 / IONEX)</h2>
-            <p class="text-sm text-gray-400 mb-4">Descarga autónoma de productos IGS Ultra-Rápidos (Órbitas/Relojes al nivel de $\approx$ 3 cm) y mallas globales IONEX para mitigación atmosférica avanzada.</p>
-            <button onclick="submitTab2()" class="w-full bg-blue-600 hover:bg-blue-500 py-2 rounded font-bold transition">Descargar Productos IGS (NAV, SP3, IONEX)</button>
+            <h2 class="text-xl mb-4 font-semibold border-b border-gray-600 pb-2">Carga Manual de Efemérides (NAV y SP3)</h2>
+            <p class="text-sm text-gray-400 mb-4">Para garantizar la estabilidad algorítmica y evitar los bloqueos de red de Vercel, carga directamente los archivos orbitales requeridos.</p>
+            <form id="form-tab2" onsubmit="submitForm(event, '/API/tab2_efemerides', 'console2', 3, true)">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                    <div>
+                        <label class="block text-sm mb-1 font-bold text-gray-300">Archivo Transmitido (.nav) [REQUERIDO]:</label>
+                        <input type="file" name="file_nav" required class="w-full bg-gray-700 p-2 rounded border border-gray-500">
+                        <p class="text-xs text-gray-400 mt-1">Efeméride base para sincronización y respaldo.</p>
+                    </div>
+                    <div>
+                        <label class="block text-sm mb-1 font-bold text-purple-400">Órbitas Precisas (.sp3) [OPCIONAL]:</label>
+                        <input type="file" name="file_sp3" class="w-full bg-gray-700 p-2 rounded border border-purple-500">
+                        <p class="text-xs text-purple-300 mt-1">Sube el archivo descomprimido para precisión milimétrica.</p>
+                    </div>
+                </div>
+                <button type="submit" class="w-full bg-purple-600 hover:bg-purple-500 py-2 rounded font-bold transition">Subir e Inyectar Efemérides en Memoria</button>
+            </form>
             <div id="console2" class="console p-4 mt-4 h-48 overflow-y-auto border border-gray-700 rounded"></div>
-            <button id="btn-pdf-tab2" onclick="descargarTextoPDF('console2', 'Informe_Descarga_IGS')" class="hidden mt-4 bg-red-600 hover:bg-red-500 text-white font-bold py-2 px-4 rounded w-full shadow-lg">Descargar PDF de Operación IGS</button>
+            <button id="btn-pdf-tab2" onclick="descargarTextoPDF('console2', 'Informe_Efemérides')" class="hidden mt-4 bg-red-600 hover:bg-red-500 text-white font-bold py-2 px-4 rounded w-full shadow-lg">Descargar PDF de Efemérides</button>
         </section>
 
         <section id="tab3" class="tab-content bg-gray-800 p-6 rounded shadow-lg">
@@ -281,14 +295,14 @@
             document.getElementById('btn-tab' + num).classList.add('bg-blue-600');
         }
 
-        async function submitForm(e, url, consoleId, nextTab) {
+        async function submitForm(e, url, consoleId, nextTab, enableTab4 = false) {
             e.preventDefault();
             const form = e.target;
             const data = new FormData(form);
             const display = document.getElementById(consoleId);
-            display.textContent = "> Procesando...\n";
+            display.textContent = "> Procesando la petición en el servidor...\n";
             
-            const pdfButtons = ['btn-pdf-tab1', 'btn-pdf-tab3', 'btn-pdf-tab4'];
+            const pdfButtons = ['btn-pdf-tab1', 'btn-pdf-tab2', 'btn-pdf-tab3', 'btn-pdf-tab4'];
             pdfButtons.forEach(id => {
                 const btn = document.getElementById(id);
                 if(btn && consoleId === id.replace('btn-pdf-', 'console')) btn.classList.add('hidden');
@@ -318,8 +332,12 @@
                     if (nextTab) {
                         document.getElementById('btn-tab' + nextTab).classList.remove('disabled-tab');
                     }
+                    if (enableTab4) {
+                        document.getElementById('btn-tab4').classList.remove('disabled-tab');
+                    }
                     
                     if (consoleId === 'console1') document.getElementById('btn-pdf-tab1').classList.remove('hidden');
+                    if (consoleId === 'console2') document.getElementById('btn-pdf-tab2').classList.remove('hidden');
                     if (consoleId === 'console3') document.getElementById('btn-pdf-tab3').classList.remove('hidden');
                     if (consoleId === 'console4') document.getElementById('btn-pdf-tab4').classList.remove('hidden');
                     
@@ -356,39 +374,6 @@
                     }
                 }
 
-            } catch (err) {
-                display.textContent += "\n[ERROR] " + err.message;
-            }
-        }
-
-        async function submitTab2() {
-            const display = document.getElementById('console2');
-            display.textContent = "> Conectando con IGS (Buscando NAV, SP3 y IONEX)...\n";
-            let fullOutput = "";
-
-            try {
-                const response = await fetch('/API/tab2_efemerides', { method: 'POST' });
-                if (!response.body) throw new Error("No se recibió respuesta del servidor.");
-                
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-
-                while (true) {
-                    const { value, done } = await reader.read();
-                    if (done) break;
-                    
-                    let text = decoder.decode(value, { stream: true });
-                    fullOutput += text;
-                    
-                    display.textContent = fullOutput;
-                    display.scrollTop = display.scrollHeight;
-                }
-
-                if (fullOutput.includes('[SUCCESS]')) {
-                    document.getElementById('btn-tab3').classList.remove('disabled-tab');
-                    document.getElementById('btn-tab4').classList.remove('disabled-tab');
-                    document.getElementById('btn-pdf-tab2').classList.remove('hidden');
-                }
             } catch (err) {
                 display.textContent += "\n[ERROR] " + err.message;
             }
@@ -445,4 +430,3 @@
     </script>
 </body>
 </html>
-
